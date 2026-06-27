@@ -326,6 +326,23 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
   activeGameStateRef.current = activeGameState;
 
   const enemiesRef = useRef<EnemyInstance[]>([]);
+  const dyingEnemiesRef = useRef<Array<{
+    id: string;
+    body: THREE.Object3D;
+    scale: number;
+    startTime: number;
+    pos: THREE.Vector3;
+    enemy: EnemyInstance;
+  }>>([]);
+  const floatingTextsRef = useRef<Array<{
+    id: string;
+    sprite: THREE.Sprite;
+    texture: THREE.CanvasTexture;
+    material: THREE.SpriteMaterial;
+    initialPos: THREE.Vector3;
+    startTime: number;
+    duration: number;
+  }>>([]);
   const droppedWeaponsRef = useRef<DroppedWeapon[]>([]);
   const particlesRef = useRef<ParticleEffect[]>([]);
   const activeWaveIndexRef = useRef<number>(0);
@@ -367,7 +384,7 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
   // Trigger weapon grab from ground
   const scavengeWeaponNearPlayer = () => {
     const player = playerStateRef.current;
-    if (activeGameState !== 'playing') return;
+    if (activeGameStateRef.current !== 'playing') return;
 
     let closestWeapon: DroppedWeapon | null = null;
     let closestDist = 2.0; // max distance for pickup
@@ -422,7 +439,7 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
   // Drop / Throw active weapon
   const throwActiveWeapon = () => {
     const player = playerStateRef.current;
-    if (activeGameState !== 'playing') return;
+    if (activeGameStateRef.current !== 'playing') return;
 
     // Prefer dropping right weapon, unless only left hand has a weapon
     let typeToThrow = WeaponType.FISTS;
@@ -576,25 +593,15 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
     sprite.scale.set(1.5, 0.4, 1);
     scene.add(sprite);
 
-    // Fade and float upward
-    const startTime = Date.now();
-    const duration = 1200;
-
-    const anim = () => {
-      const elapsed = Date.now() - startTime;
-      const progress = elapsed / duration;
-
-      if (progress >= 1.0) {
-        scene.remove(sprite);
-        texture.dispose();
-        mat.dispose();
-      } else {
-        sprite.position.y = pos.y + progress * 0.8;
-        mat.opacity = 1.0 - progress;
-        requestAnimationFrame(anim);
-      }
-    };
-    anim();
+    floatingTextsRef.current.push({
+      id: Math.random().toString(),
+      sprite,
+      texture,
+      material: mat,
+      initialPos: pos.clone(),
+      startTime: Date.now(),
+      duration: 1200
+    });
   };
 
   // Start Attack Animation logic (fists or weapons)
@@ -751,28 +758,20 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
     const scene = sceneRef.current;
     const body = enemy.mesh;
     if (scene && body) {
-      const deathTime = Date.now();
-      const shrinkAnim = () => {
-        const elapsed = Date.now() - deathTime;
-        const progress = elapsed / 1000; // 1 second animation
-
-        if (progress >= 1.0) {
-          scene.remove(body);
-          // Delete from references
-          enemiesRef.current = enemiesRef.current.filter((e) => e.id !== enemy.id);
-          
-          // Re-trigger database scan to check if all wave enemies are dead
-          checkWaveCompletion();
-        } else {
-          body.position.y = enemy.position.y + progress * 1.5;
-          body.rotation.x += 4 * dt;
-          body.scale.setScalar(enemy.scale * (1.0 - progress));
-          requestAnimationFrame(shrinkAnim);
-        }
-      };
+      // Filter out immediately so we don't block wave completion checks
+      enemiesRef.current = enemiesRef.current.filter((e) => e.id !== enemy.id);
       
-      const dt = 0.016; // mock frame time
-      shrinkAnim();
+      dyingEnemiesRef.current.push({
+        id: enemy.id,
+        body,
+        scale: enemy.scale,
+        startTime: Date.now(),
+        pos: enemy.position.clone(),
+        enemy
+      });
+
+      // Re-trigger level check
+      checkWaveCompletion();
     }
   };
 
@@ -1036,6 +1035,18 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
       if (sceneRef.current && p.mesh) sceneRef.current.remove(p.mesh);
     });
     particlesRef.current = [];
+
+    floatingTextsRef.current.forEach((ft) => {
+      if (sceneRef.current) sceneRef.current.remove(ft.sprite);
+      ft.texture.dispose();
+      ft.material.dispose();
+    });
+    floatingTextsRef.current = [];
+
+    dyingEnemiesRef.current.forEach((de) => {
+      if (sceneRef.current) sceneRef.current.remove(de.body);
+    });
+    dyingEnemiesRef.current = [];
 
     const player = playerStateRef.current;
     player.health = 100;
@@ -1984,6 +1995,40 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
         }
       });
       particlesRef.current = particlesRef.current.filter((p) => p.alpha > 0);
+
+      // 10. UPDATE FLOATING TEXTS (WebXR Compatible)
+      const nowMs = Date.now();
+      floatingTextsRef.current.forEach((ft) => {
+        const elapsed = nowMs - ft.startTime;
+        const progress = elapsed / ft.duration;
+
+        if (progress >= 1.0) {
+          if (scene) scene.remove(ft.sprite);
+          ft.texture.dispose();
+          ft.material.dispose();
+        } else {
+          ft.sprite.position.y = ft.initialPos.y + progress * 0.8;
+          ft.material.opacity = 1.0 - progress;
+        }
+      });
+      // Purge finished floating texts
+      floatingTextsRef.current = floatingTextsRef.current.filter((ft) => (nowMs - ft.startTime) < ft.duration);
+
+      // 11. UPDATE DYING ENEMIES (WebXR Compatible)
+      dyingEnemiesRef.current.forEach((de) => {
+        const elapsed = nowMs - de.startTime;
+        const progress = elapsed / 1000; // 1.0 second duration
+
+        if (progress >= 1.0) {
+          if (scene) scene.remove(de.body);
+        } else {
+          de.body.position.y = de.pos.y + progress * 1.5;
+          de.body.rotation.x += 4 * dt;
+          de.body.scale.setScalar(de.scale * (1.0 - progress));
+        }
+      });
+      // Purge finished dying bodies
+      dyingEnemiesRef.current = dyingEnemiesRef.current.filter((de) => (nowMs - de.startTime) < 1000);
 
       // Render Scene
       renderer.render(scene, camera);
