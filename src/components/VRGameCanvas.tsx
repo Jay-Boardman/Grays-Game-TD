@@ -329,6 +329,7 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
   // ThreeJS Scene Elements
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const dollyRef = useRef<THREE.Group | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const physicsRef = useRef<PhysicsEngine>(new PhysicsEngine());
   const weaponVisualBuilderRef = useRef<WeaponVisualBuilder>(new WeaponVisualBuilder());
@@ -1043,6 +1044,13 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
     camera.position.set(0, 1.6, 0); // first person eye height
     cameraRef.current = camera;
 
+    // Create player dolly (parent of camera and controllers) for WebXR locomotion
+    const dolly = new THREE.Group();
+    dolly.name = "player_dolly";
+    dolly.add(camera);
+    scene.add(dolly);
+    dollyRef.current = dolly;
+
     // Renderer
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(containerRef.current.clientWidth, containerRef.current.clientHeight);
@@ -1206,8 +1214,8 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
     controller1.addEventListener('squeezestart', onVRGripStartLeft);
     controller2.addEventListener('squeezestart', onVRGripStartRight);
 
-    scene.add(controller1);
-    scene.add(controller2);
+    dolly.add(controller1);
+    dolly.add(controller2);
     xrControllersRef.current = [controller1, controller2];
 
     // Check VR Availability
@@ -1237,6 +1245,7 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
 
       if (gameLoopId.current) cancelAnimationFrame(gameLoopId.current);
       if (rendererRef.current) {
+        rendererRef.current.setAnimationLoop(null);
         rendererRef.current.dispose();
         if (rendererRef.current.domElement && targetElement.contains(rendererRef.current.domElement)) {
           targetElement.removeChild(rendererRef.current.domElement);
@@ -1249,14 +1258,11 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
   useEffect(() => {
     let lastTime = performance.now();
 
-    const gameTick = () => {
-      if (activeGameState !== 'playing') {
-        gameLoopId.current = requestAnimationFrame(gameTick);
-        return;
-      }
-
-      const now = performance.now();
-      const dt = (now - lastTime) / 1000;
+    const gameTick = (time?: number) => {
+      const now = time || performance.now();
+      let dt = (now - lastTime) / 1000;
+      // Cap delta time to prevent physics explosions on frame stutter or tab sleep
+      if (dt > 0.1) dt = 0.1;
       lastTime = now;
 
       const scene = sceneRef.current;
@@ -1267,7 +1273,12 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
       const currentTime = Date.now();
 
       if (!scene || !camera || !renderer) {
-        gameLoopId.current = requestAnimationFrame(gameTick);
+        return;
+      }
+
+      // Always render in VR to keep the headset rendering and avoid freezing, even if in menu
+      if (activeGameState !== 'playing') {
+        renderer.render(scene, camera);
         return;
       }
 
@@ -1315,29 +1326,71 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
         player.velocity.z += moveForce.z * activeSpeed * dt * 10;
       }
 
+      // 3b. VR CONTROLLER LOCOMOTION (Thumbstick inputs)
+      if (renderer.xr.isPresenting) {
+        const session = renderer.xr.getSession();
+        if (session) {
+          const inputSources = session.inputSources;
+          inputSources.forEach((source) => {
+            if (source.gamepad) {
+              const axes = source.gamepad.axes;
+              // Left hand thumbstick is typically axes[2] (X) and axes[3] (Y)
+              if (source.handedness === 'left' && axes.length >= 4) {
+                const stickX = axes[2];
+                const stickY = axes[3];
+
+                const vrMoveForce = new THREE.Vector3(0, 0, 0);
+                if (Math.abs(stickY) > 0.1) {
+                  vrMoveForce.addScaledVector(forwardDir, -stickY);
+                }
+                if (Math.abs(stickX) > 0.1) {
+                  vrMoveForce.addScaledVector(rightDir, stickX);
+                }
+
+                if (vrMoveForce.lengthSq() > 0.01) {
+                  vrMoveForce.normalize();
+                  const activeSpeed = 7.5;
+                  player.velocity.x += vrMoveForce.x * activeSpeed * dt * 10;
+                  player.velocity.z += vrMoveForce.z * activeSpeed * dt * 10;
+                }
+              }
+              // Right hand thumbstick can be used for smooth/snap turning!
+              else if (source.handedness === 'right' && axes.length >= 4) {
+                const stickX = axes[2];
+                if (Math.abs(stickX) > 0.15) {
+                  // Rotate player's camera/dolly smoothly around world Y-axis
+                  if (dollyRef.current) {
+                    dollyRef.current.rotateOnWorldAxis(new THREE.Vector3(0, 1, 0), -stickX * dt * 2.0);
+                  }
+                }
+              }
+            }
+          });
+        }
+      }
+
       // 4. RUN PHYSICS SIMULATION FOR PLAYER
       const currentConfig = TOWER_FLOORS.find((f) => f.floorNumber === player.floor);
       const towerRadius = currentConfig ? currentConfig.radius : 15.0;
 
       physics.updateObject(player, dt, towerRadius);
 
-      // Bind camera position to follow player's head height
-      if (renderer.xr.isPresenting) {
-        // In WebVR mode, camera position is managed by HMD tracking automatically.
-        // We sync playerState physics center coordinate to the XR camera position!
-        const xrCamera = renderer.xr.getCamera(camera);
-        player.position.copy(xrCamera.position);
-      } else {
-        // Desktop mode: position camera at head offset
-        camera.position.set(player.position.x, player.position.y + 1.6, player.position.z);
+      // Bind dolly position to follow player's coordinate
+      if (dollyRef.current) {
+        dollyRef.current.position.copy(player.position);
+      }
+      
+      // In desktop mode, set local camera offset to head height (0, 1.6, 0)
+      if (!renderer.xr.isPresenting) {
+        camera.position.set(0, 1.6, 0);
       }
 
       // 5. RENDER WEAPON HELD MODELS (DESKTOP MODE FLOATING HANDS)
       if (!renderer.xr.isPresenting) {
         // Bind hand attachment slots smoothly to camera sides
         if (playerLeftHandMeshRef.current) {
-          playerLeftHandMeshRef.current.position.copy(camera.position);
-          playerLeftHandMeshRef.current.quaternion.copy(camera.quaternion);
+          camera.getWorldPosition(playerLeftHandMeshRef.current.position);
+          camera.getWorldQuaternion(playerLeftHandMeshRef.current.quaternion);
           
           // Animate striking swing forward arc
           const swingProgress = (currentTime - player.lastAttackTimeLeft) / WEAPON_REGISTRY[player.leftWeapon].cooldown;
@@ -1354,8 +1407,8 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
         }
 
         if (playerRightHandMeshRef.current) {
-          playerRightHandMeshRef.current.position.copy(camera.position);
-          playerRightHandMeshRef.current.quaternion.copy(camera.quaternion);
+          camera.getWorldPosition(playerRightHandMeshRef.current.position);
+          camera.getWorldQuaternion(playerRightHandMeshRef.current.quaternion);
 
           // Animate striking
           const swingProgress = (currentTime - player.lastAttackTimeRight) / WEAPON_REGISTRY[player.rightWeapon].cooldown;
@@ -1374,12 +1427,12 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
         const controllerR = renderer.xr.getController(1);
 
         if (playerLeftHandMeshRef.current && controllerL.visible) {
-          playerLeftHandMeshRef.current.position.copy(controllerL.position);
-          playerLeftHandMeshRef.current.quaternion.copy(controllerL.quaternion);
+          controllerL.getWorldPosition(playerLeftHandMeshRef.current.position);
+          controllerL.getWorldQuaternion(playerLeftHandMeshRef.current.quaternion);
         }
         if (playerRightHandMeshRef.current && controllerR.visible) {
-          playerRightHandMeshRef.current.position.copy(controllerR.position);
-          playerRightHandMeshRef.current.quaternion.copy(controllerR.quaternion);
+          controllerR.getWorldPosition(playerRightHandMeshRef.current.position);
+          controllerR.getWorldQuaternion(playerRightHandMeshRef.current.quaternion);
         }
       }
 
@@ -1518,14 +1571,16 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
 
       // Render Scene
       renderer.render(scene, camera);
-
-      gameLoopId.current = requestAnimationFrame(gameTick);
     };
 
-    gameLoopId.current = requestAnimationFrame(gameTick);
+    if (rendererRef.current) {
+      rendererRef.current.setAnimationLoop(gameTick);
+    }
 
     return () => {
-      if (gameLoopId.current) cancelAnimationFrame(gameLoopId.current);
+      if (rendererRef.current) {
+        rendererRef.current.setAnimationLoop(null);
+      }
     };
   }, [activeGameState]);
 
