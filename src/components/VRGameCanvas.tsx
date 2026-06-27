@@ -301,7 +301,7 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
     id: 'player',
     position: new THREE.Vector3(0, 0, 4),
     velocity: new THREE.Vector3(0, 0, 0),
-    radius: 0.8,
+    radius: 0.35,
     height: 1.8,
     isGrounded: true,
     mass: 20.0, // Substantially increased mass so player doesn't get pushed around by normal skeletons/enemies
@@ -1579,12 +1579,12 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
     camWorldDir.normalize();
 
     if (gameState === 'playing') {
-      // Lowered, slightly smaller HUD floating 1.6m in front of the viewport (below active combat swing line)
-      mesh.position.copy(camWorldPos).addScaledVector(camWorldDir, 1.6);
-      mesh.position.y = camWorldPos.y - 0.45; // Lowered below eye sight line
-      mesh.scale.setScalar(0.55);
+      // Mount as a massive center hanging arena billboard (Jumbotron) in the center of the room!
+      // This integrates it seamlessly into the map as a giant screen, out of the player's immediate view but fully visible.
+      mesh.position.set(0, 5.2, 0);
+      mesh.scale.setScalar(3.0);
     } else {
-      // Comfortable large eye-level floating menu 1.8 meters in front
+      // Comfortable large eye-level floating menu 1.8 meters in front for lobby menus
       mesh.position.copy(camWorldPos).addScaledVector(camWorldDir, 1.8);
       mesh.position.y = camWorldPos.y - 0.05;
       mesh.scale.setScalar(1.0);
@@ -1634,13 +1634,27 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
         const controllerL = renderer.xr.getController(0);
         const controllerR = renderer.xr.getController(1);
 
-        if (playerLeftHandMeshRef.current && controllerL.visible) {
+        if (playerLeftHandMeshRef.current) {
           controllerL.getWorldPosition(playerLeftHandMeshRef.current.position);
           controllerL.getWorldQuaternion(playerLeftHandMeshRef.current.quaternion);
+          // If untracked/origin, anchor cleanly in front of headset camera view as a fallback
+          if (playerLeftHandMeshRef.current.position.lengthSq() === 0) {
+            camera.getWorldPosition(playerLeftHandMeshRef.current.position);
+            camera.getWorldQuaternion(playerLeftHandMeshRef.current.quaternion);
+            const offsetL = new THREE.Vector3(-0.25, -0.22, -0.5).applyQuaternion(camera.quaternion);
+            playerLeftHandMeshRef.current.position.add(offsetL);
+          }
         }
-        if (playerRightHandMeshRef.current && controllerR.visible) {
+        if (playerRightHandMeshRef.current) {
           controllerR.getWorldPosition(playerRightHandMeshRef.current.position);
           controllerR.getWorldQuaternion(playerRightHandMeshRef.current.quaternion);
+          // If untracked/origin, anchor cleanly in front of headset camera view as a fallback
+          if (playerRightHandMeshRef.current.position.lengthSq() === 0) {
+            camera.getWorldPosition(playerRightHandMeshRef.current.position);
+            camera.getWorldQuaternion(playerRightHandMeshRef.current.quaternion);
+            const offsetR = new THREE.Vector3(0.25, -0.22, -0.5).applyQuaternion(camera.quaternion);
+            playerRightHandMeshRef.current.position.add(offsetR);
+          }
         }
 
         // Right hand thumbstick can be used for smooth/snap camera turning even in menus!
@@ -1814,13 +1828,27 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
         const controllerL = renderer.xr.getController(0);
         const controllerR = renderer.xr.getController(1);
 
-        if (playerLeftHandMeshRef.current && controllerL.visible) {
+        if (playerLeftHandMeshRef.current) {
           controllerL.getWorldPosition(playerLeftHandMeshRef.current.position);
           controllerL.getWorldQuaternion(playerLeftHandMeshRef.current.quaternion);
+          // If untracked/origin, anchor cleanly in front of headset camera view as a fallback
+          if (playerLeftHandMeshRef.current.position.lengthSq() === 0) {
+            camera.getWorldPosition(playerLeftHandMeshRef.current.position);
+            camera.getWorldQuaternion(playerLeftHandMeshRef.current.quaternion);
+            const offsetL = new THREE.Vector3(-0.25, -0.22, -0.5).applyQuaternion(camera.quaternion);
+            playerLeftHandMeshRef.current.position.add(offsetL);
+          }
         }
-        if (playerRightHandMeshRef.current && controllerR.visible) {
+        if (playerRightHandMeshRef.current) {
           controllerR.getWorldPosition(playerRightHandMeshRef.current.position);
           controllerR.getWorldQuaternion(playerRightHandMeshRef.current.quaternion);
+          // If untracked/origin, anchor cleanly in front of headset camera view as a fallback
+          if (playerRightHandMeshRef.current.position.lengthSq() === 0) {
+            camera.getWorldPosition(playerRightHandMeshRef.current.position);
+            camera.getWorldQuaternion(playerRightHandMeshRef.current.quaternion);
+            const offsetR = new THREE.Vector3(0.25, -0.22, -0.5).applyQuaternion(camera.quaternion);
+            playerRightHandMeshRef.current.position.add(offsetR);
+          }
         }
       }
 
