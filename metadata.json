@@ -1,0 +1,6 @@
+{
+  "name": "Tower Descent VR",
+  "description": "A physics-based VR fighting game where you start at the top of a medieval tower and fight your way down to the ground floor.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
