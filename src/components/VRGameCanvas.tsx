@@ -304,7 +304,7 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
     radius: 0.8,
     height: 1.8,
     isGrounded: true,
-    mass: 1.5,
+    mass: 20.0, // Substantially increased mass so player doesn't get pushed around by normal skeletons/enemies
     health: 100,
     maxHealth: 100,
     score: 0,
@@ -318,6 +318,12 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
     immunityUntil: 0,
     kills: 0
   });
+
+  const activeGameStateRef = useRef(activeGameState);
+  const vrUIPanelMeshRef = useRef<THREE.Mesh | null>(null);
+
+  // Sync activeGameStateRef when the prop changes
+  activeGameStateRef.current = activeGameState;
 
   const enemiesRef = useRef<EnemyInstance[]>([]);
   const droppedWeaponsRef = useRef<DroppedWeapon[]>([]);
@@ -632,15 +638,50 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
     enemiesRef.current.forEach((enemy) => {
       if (enemy.state === 'dying') return;
 
-      const check = physicsRef.current.checkStrikeHit(
-        player.position,
-        lookDir,
-        enemy,
-        sweepReach,
-        Math.PI / 1.8 // sweeping horizontal arc cone
-      );
+      let isHit = false;
+      let pushVector = new THREE.Vector3();
 
-      if (check.hit) {
+      if (rendererRef.current?.xr.isPresenting) {
+        // VR Mode check: hand/controller world position to enemy center
+        const handPos = new THREE.Vector3();
+        if (isLeft && playerLeftHandMeshRef.current) {
+          playerLeftHandMeshRef.current.getWorldPosition(handPos);
+        } else if (!isLeft && playerRightHandMeshRef.current) {
+          playerRightHandMeshRef.current.getWorldPosition(handPos);
+        } else {
+          // Fallback to controller
+          const controller = rendererRef.current.xr.getController(isLeft ? 0 : 1);
+          if (controller) controller.getWorldPosition(handPos);
+        }
+
+        // Horizontal distance from hand to enemy
+        const dx = enemy.position.x - handPos.x;
+        const dz = enemy.position.z - handPos.z;
+        const distHorizontal = Math.sqrt(dx * dx + dz * dz);
+
+        // Height of enemy goes from enemy.position.y to enemy.position.y + enemy.height
+        const withinHeight = handPos.y >= enemy.position.y - 0.5 && handPos.y <= enemy.position.y + enemy.height + 0.5;
+
+        // In VR, let's also give a small reach buffer to make melee combat feel highly responsive and satisfying!
+        const hitReach = Math.max(stats.reach, 1.8);
+        if (distHorizontal < hitReach + enemy.radius && withinHeight) {
+          isHit = true;
+          pushVector.set(dx, 0, dz).normalize();
+        }
+      } else {
+        // Desktop Mode: Camera looking check
+        const check = physicsRef.current.checkStrikeHit(
+          player.position,
+          lookDir,
+          enemy,
+          sweepReach,
+          Math.PI / 1.8 // sweeping horizontal arc cone
+        );
+        isHit = check.hit;
+        pushVector = check.pushVector;
+      }
+
+      if (isHit) {
         hitAny = true;
         
         // Damage Enemy
@@ -660,7 +701,7 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
         
         // Apply knockback velocity (Mass matters! Heavy bosses recoil less)
         const knockbackScalar = (stats.impactForce * 4.0) / enemy.mass;
-        enemy.velocity.add(check.pushVector.multiplyScalar(knockbackScalar));
+        enemy.velocity.add(pushVector.multiplyScalar(knockbackScalar));
         enemy.velocity.y = 1.8; // pop them up into the air slightly!
 
         // Play metal clashing sound or solid wet punch impact
@@ -1196,17 +1237,38 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
     const controller2 = renderer.xr.getController(1);
 
     const onVRTriggerStartLeft = () => {
-      performPlayerAttack(true);
+      const state = activeGameStateRef.current;
+      if (state === 'menu') {
+        handleRestartGame();
+      } else if (state === 'gameover') {
+        onGameStateChange('menu');
+      } else if (state === 'victory') {
+        onGameStateChange('menu');
+      } else if (state === 'playing') {
+        performPlayerAttack(true);
+      }
     };
     const onVRTriggerStartRight = () => {
-      performPlayerAttack(false);
+      const state = activeGameStateRef.current;
+      if (state === 'menu') {
+        handleRestartGame();
+      } else if (state === 'gameover') {
+        handleRestartGame();
+      } else if (state === 'victory') {
+        handleRestartGame();
+      } else if (state === 'playing') {
+        performPlayerAttack(false);
+      }
     };
     const onVRGripStartLeft = () => {
-      // Pick up weapon or grab
-      scavengeWeaponNearPlayer();
+      if (activeGameStateRef.current === 'playing') {
+        scavengeWeaponNearPlayer();
+      }
     };
     const onVRGripStartRight = () => {
-      scavengeWeaponNearPlayer();
+      if (activeGameStateRef.current === 'playing') {
+        scavengeWeaponNearPlayer();
+      }
     };
 
     controller1.addEventListener('selectstart', onVRTriggerStartLeft);
@@ -1254,6 +1316,284 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
     };
   }, []);
 
+  // --- DYNAMIC INTERACTIVE VR UI PANEL (CanvasTexture on 3D Plane) ---
+  const updateOrCreateVRUIPanel = (scene: THREE.Scene, camera: THREE.Camera) => {
+    if (!rendererRef.current?.xr.isPresenting) {
+      if (vrUIPanelMeshRef.current) {
+        scene.remove(vrUIPanelMeshRef.current);
+        vrUIPanelMeshRef.current = null;
+      }
+      return;
+    }
+
+    const gameState = activeGameStateRef.current;
+    const player = playerStateRef.current;
+
+    // Create the canvas, ctx, and texture lazily and persist them
+    let canvas = (updateOrCreateVRUIPanel as any).canvas;
+    let ctx = (updateOrCreateVRUIPanel as any).ctx;
+    let texture = (updateOrCreateVRUIPanel as any).texture;
+
+    if (!canvas) {
+      canvas = document.createElement('canvas');
+      canvas.width = 512;
+      canvas.height = 512;
+      ctx = canvas.getContext('2d')!;
+      texture = new THREE.CanvasTexture(canvas);
+      (updateOrCreateVRUIPanel as any).canvas = canvas;
+      (updateOrCreateVRUIPanel as any).ctx = ctx;
+      (updateOrCreateVRUIPanel as any).texture = texture;
+    }
+
+    // Draw UI onto HTML5 2D Canvas
+    ctx.clearRect(0, 0, 512, 512);
+
+    // Deep semi-transparent gradient background card
+    const rGrad = ctx.createRadialGradient(256, 256, 50, 256, 256, 350);
+    rGrad.addColorStop(0, 'rgba(15, 23, 42, 0.95)'); // Slate-900
+    rGrad.addColorStop(1, 'rgba(2,  6,  23,  0.98)'); // Slate-950
+    ctx.fillStyle = rGrad;
+    
+    // Draw rounded outer frame
+    const radius = 24;
+    ctx.beginPath();
+    ctx.roundRect(10, 10, 492, 492, radius);
+    ctx.fill();
+
+    // Border glowing neon outline
+    ctx.lineWidth = 8;
+    if (gameState === 'menu') {
+      ctx.strokeStyle = '#2563eb'; // Deep Blue outline
+    } else if (gameState === 'gameover') {
+      ctx.strokeStyle = '#ef4444'; // Red outline
+    } else if (gameState === 'victory') {
+      ctx.strokeStyle = '#10b981'; // Emerald outline
+    } else {
+      ctx.strokeStyle = '#06b6d4'; // Cyan outline for active gameplay HUD
+    }
+    ctx.stroke();
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffffff';
+
+    if (gameState === 'menu') {
+      // Header Logo
+      ctx.font = 'bold 38px sans-serif';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText('TOWER DESCENT', 256, 75);
+      
+      ctx.font = 'bold 15px sans-serif';
+      ctx.fillStyle = '#f59e0b'; // Amber
+      ctx.fillText('PHYSICS-BASED MELEE RPG', 256, 115);
+
+      // Story/Premise text
+      ctx.font = '14px sans-serif';
+      ctx.fillStyle = '#9ca3af'; // Gray
+      ctx.fillText('You awaken unarmed at the high spire. Escaped but', 256, 160);
+      ctx.fillText('weaponless, defeat guardians and descend 5 floors.', 256, 182);
+
+      // Interactive Start button visual block
+      ctx.fillStyle = '#3b82f6'; // Bright blue
+      ctx.beginPath();
+      ctx.roundRect(100, 230, 312, 70, 14);
+      ctx.fill();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      ctx.font = 'bold 22px sans-serif';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText('START CONQUEST', 256, 273);
+
+      // Instructions
+      ctx.font = 'bold 15px monospace';
+      ctx.fillStyle = '#cbd5e1';
+      ctx.fillText('SQUEEZE TRIGGER ON EITHER CONTROLLER', 256, 350);
+      ctx.fillText('TO COMMENCE FIGHTING!', 256, 375);
+
+      // Controls breakdown
+      ctx.font = '13px sans-serif';
+      ctx.fillStyle = '#64748b';
+      ctx.fillText('Left Thumbstick: Locomotion (No Inertia)', 256, 430);
+      ctx.fillText('Right Thumbstick: Smooth/Snap Camera Rotation', 256, 452);
+      ctx.fillText('Squeeze Grips: Scavenge Dropped Weapons', 256, 474);
+
+    } else if (gameState === 'gameover') {
+      // Death Screen UI
+      ctx.font = 'bold 44px sans-serif';
+      ctx.fillStyle = '#ef4444';
+      ctx.fillText('YOU DIED', 256, 85);
+
+      ctx.font = '18px sans-serif';
+      ctx.fillStyle = '#cbd5e1';
+      ctx.fillText(`Kills: ${player.kills}    Score: ${player.score.toLocaleString()} PTS`, 256, 140);
+      ctx.fillText(`Floor: ${6 - player.floor} of 5`, 256, 170);
+
+      // Right Controller Trigger option: REPLAY
+      ctx.fillStyle = '#ef4444';
+      ctx.beginPath();
+      ctx.roundRect(60, 215, 392, 60, 12);
+      ctx.fill();
+      ctx.font = 'bold 18px sans-serif';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText('REVIVE & RETRY', 256, 252);
+
+      ctx.font = 'bold 13px monospace';
+      ctx.fillStyle = '#fca5a5';
+      ctx.fillText('SQUEEZE RIGHT CONTROLLER TRIGGER TO REPLAY', 256, 305);
+
+      // Left Controller Trigger option: MENU
+      ctx.fillStyle = '#334155';
+      ctx.beginPath();
+      ctx.roundRect(60, 345, 392, 60, 12);
+      ctx.fill();
+      ctx.font = 'bold 18px sans-serif';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText('RETURN TO LOBBY', 256, 382);
+
+      ctx.font = 'bold 13px monospace';
+      ctx.fillStyle = '#cbd5e1';
+      ctx.fillText('SQUEEZE LEFT CONTROLLER TRIGGER FOR MENU', 256, 435);
+
+    } else if (gameState === 'victory') {
+      // Victory Screen UI
+      ctx.font = 'bold 40px sans-serif';
+      ctx.fillStyle = '#10b981';
+      ctx.fillText('CONQUEST COMPLETE', 256, 85);
+
+      ctx.font = '16px sans-serif';
+      ctx.fillStyle = '#cbd5e1';
+      ctx.fillText('You conquered the final boss and escaped the Spire!', 256, 130);
+      ctx.fillText(`Final Honor Score: ${player.score.toLocaleString()} PTS`, 256, 160);
+
+      // Right Controller option: PLAY AGAIN
+      ctx.fillStyle = '#10b981';
+      ctx.beginPath();
+      ctx.roundRect(60, 215, 392, 60, 12);
+      ctx.fill();
+      ctx.font = 'bold 18px sans-serif';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText('RE-ENTER THE SPIRE', 256, 252);
+
+      ctx.font = 'bold 13px monospace';
+      ctx.fillStyle = '#a7f3d0';
+      ctx.fillText('SQUEEZE RIGHT CONTROLLER TRIGGER TO REPLAY', 256, 305);
+
+      // Left Controller option: MENU
+      ctx.fillStyle = '#334155';
+      ctx.beginPath();
+      ctx.roundRect(60, 345, 392, 60, 12);
+      ctx.fill();
+      ctx.font = 'bold 18px sans-serif';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText('RETURN TO LOBBY', 256, 382);
+
+      ctx.font = 'bold 13px monospace';
+      ctx.fillStyle = '#cbd5e1';
+      ctx.fillText('SQUEEZE LEFT CONTROLLER TRIGGER FOR MENU', 256, 435);
+
+    } else if (gameState === 'playing') {
+      // Dynamic in-game HUD
+      ctx.font = 'bold 28px sans-serif';
+      ctx.fillStyle = '#06b6d4'; // Cyan
+      ctx.fillText(`FLOOR ${6 - player.floor} OF 5`, 256, 60);
+
+      // Draw custom high-fidelity 3D-feeling HP Bar
+      ctx.fillStyle = '#1e293b';
+      ctx.beginPath();
+      ctx.roundRect(40, 100, 432, 45, 12);
+      ctx.fill();
+
+      const hpPercent = Math.max(0, player.health / player.maxHealth);
+      const hpColor = hpPercent > 0.35 ? '#10b981' : '#ef4444';
+      ctx.fillStyle = hpColor;
+      ctx.beginPath();
+      ctx.roundRect(44, 104, 424 * hpPercent, 37, 10);
+      ctx.fill();
+
+      ctx.font = 'bold 20px sans-serif';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(`HP: ${player.health} / ${player.maxHealth}`, 256, 129);
+
+      // Interactive wave and kills status counters
+      ctx.font = '18px sans-serif';
+      ctx.fillStyle = '#9ca3af';
+      ctx.fillText(`SCORE: ${player.score.toLocaleString()}      KILLS: ${player.kills}`, 256, 195);
+
+      // Slotted hands indicators
+      ctx.fillStyle = '#1e293b';
+      ctx.beginPath();
+      ctx.roundRect(40, 240, 432, 90, 10);
+      ctx.fill();
+
+      ctx.font = 'bold 14px sans-serif';
+      ctx.fillStyle = '#38bdf8';
+      ctx.fillText('SLOTTED ARMAMENTS', 256, 265);
+      
+      ctx.font = '15px monospace';
+      ctx.fillStyle = '#f1f5f9';
+      ctx.fillText(`Left Hand: ${player.leftWeapon}`, 256, 292);
+      ctx.fillText(`Right Hand: ${player.rightWeapon}`, 256, 315);
+
+      ctx.font = '14px sans-serif';
+      ctx.fillStyle = '#64748b';
+      ctx.fillText('Swing controllers to target and hit enemies!', 256, 380);
+      ctx.fillText('Walk over dropped weapons, Squeeze Grip to scavenge.', 256, 405);
+      
+      // Heartbeat pulse warning
+      if (hpPercent <= 0.35) {
+        ctx.font = 'bold 16px sans-serif';
+        ctx.fillStyle = '#f87171';
+        ctx.fillText('⚠️ CRITICAL HEALTH WARNING ⚠️', 256, 460);
+      }
+    }
+
+    texture.needsUpdate = true;
+
+    // Create the physical mesh if it doesn't exist
+    if (!vrUIPanelMeshRef.current) {
+      const geom = new THREE.PlaneGeometry(1.5, 1.5);
+      const mat = new THREE.MeshBasicMaterial({
+        map: texture,
+        transparent: true,
+        side: THREE.DoubleSide,
+        depthTest: true,
+        depthWrite: true
+      });
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.name = "vr_ui_panel";
+      scene.add(mesh);
+      vrUIPanelMeshRef.current = mesh;
+    }
+
+    // Positions and orient the mesh beautifully in front of the VR camera!
+    const mesh = vrUIPanelMeshRef.current;
+    
+    const camWorldPos = new THREE.Vector3();
+    const camWorldDir = new THREE.Vector3();
+    camera.getWorldPosition(camWorldPos);
+    camera.getWorldDirection(camWorldDir);
+
+    // Filter out vertical tilt to keep the screen solid, upright, and extremely readable (prevents dizzying motion)
+    camWorldDir.y = 0;
+    camWorldDir.normalize();
+
+    if (gameState === 'playing') {
+      // Lowered, slightly smaller HUD floating 1.6m in front of the viewport (below active combat swing line)
+      mesh.position.copy(camWorldPos).addScaledVector(camWorldDir, 1.6);
+      mesh.position.y = camWorldPos.y - 0.45; // Lowered below eye sight line
+      mesh.scale.setScalar(0.55);
+    } else {
+      // Comfortable large eye-level floating menu 1.8 meters in front
+      mesh.position.copy(camWorldPos).addScaledVector(camWorldDir, 1.8);
+      mesh.position.y = camWorldPos.y - 0.05;
+      mesh.scale.setScalar(1.0);
+    }
+
+    // Orient mesh to face the player's headset directly
+    mesh.lookAt(new THREE.Vector3(camWorldPos.x, mesh.position.y, camWorldPos.z));
+  };
+
   // --- CORE GAME TICK LOOP ---
   useEffect(() => {
     let lastTime = performance.now();
@@ -1276,13 +1616,7 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
         return;
       }
 
-      // Always render in VR to keep the headset rendering and avoid freezing, even if in menu
-      if (activeGameState !== 'playing') {
-        renderer.render(scene, camera);
-        return;
-      }
-
-      // 1. UPDATE WALL TORCHES FLICKER
+      // 1. UPDATE WALL TORCHES FLICKER (Always active for atmosphere!)
       if (floorGroupRef.current) {
         floorGroupRef.current.children.forEach((torch) => {
           const light = torch.getObjectByName("torch_light") as THREE.PointLight;
@@ -1295,7 +1629,58 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
         });
       }
 
-      // 2. PLAYER FIRST PERSON LOOK ROTATION (IF NOT IN VR)
+      // 2. ALWAYS POSITION AND TRACK WEAPON HELD MODELS / HANDS IN VR
+      if (renderer.xr.isPresenting) {
+        const controllerL = renderer.xr.getController(0);
+        const controllerR = renderer.xr.getController(1);
+
+        if (playerLeftHandMeshRef.current && controllerL.visible) {
+          controllerL.getWorldPosition(playerLeftHandMeshRef.current.position);
+          controllerL.getWorldQuaternion(playerLeftHandMeshRef.current.quaternion);
+        }
+        if (playerRightHandMeshRef.current && controllerR.visible) {
+          controllerR.getWorldPosition(playerRightHandMeshRef.current.position);
+          controllerR.getWorldQuaternion(playerRightHandMeshRef.current.quaternion);
+        }
+
+        // Right hand thumbstick can be used for smooth/snap camera turning even in menus!
+        const session = renderer.xr.getSession();
+        if (session) {
+          const inputSources = session.inputSources;
+          inputSources.forEach((source) => {
+            if (source.gamepad && source.handedness === 'right') {
+              const axes = source.gamepad.axes;
+              if (axes.length >= 4) {
+                const stickX = axes[2];
+                if (Math.abs(stickX) > 0.15) {
+                  if (dollyRef.current) {
+                    dollyRef.current.rotateOnWorldAxis(new THREE.Vector3(0, 1, 0), -stickX * dt * 2.0);
+                  }
+                }
+              }
+            }
+          });
+        }
+      }
+
+      // 3. ALWAYS UPDATE THE VR FLOATING UI PANEL (Main Menu, HUD, Game Over, Victory)
+      if (renderer.xr.isPresenting) {
+        updateOrCreateVRUIPanel(scene, camera);
+      } else {
+        // Hide panel in desktop/lobby mode
+        if (vrUIPanelMeshRef.current) {
+          scene.remove(vrUIPanelMeshRef.current);
+          vrUIPanelMeshRef.current = null;
+        }
+      }
+
+      // 4. IF GAME STATE IS NOT 'PLAYING', JUST RENDER SCENE AND EXIT (Keeps WebXR tracking and UI responsive!)
+      if (activeGameStateRef.current !== 'playing') {
+        renderer.render(scene, camera);
+        return;
+      }
+
+      // 5. PLAYER FIRST PERSON LOOK ROTATION (IF NOT IN VR)
       if (!renderer.xr.isPresenting) {
         // Construct visual Euler quaternion
         const euler = new THREE.Euler(0, 0, 0, 'YXZ');
@@ -1304,7 +1689,7 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
         camera.quaternion.setFromEuler(euler);
       }
 
-      // 3. KEYBOARD PLAYER MOVEMENT (First Person Perspective)
+      // 6. KEYBOARD PLAYER MOVEMENT (First Person Perspective)
       const forwardDir = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
       forwardDir.y = 0; // lock to horizontal plane
       forwardDir.normalize();
@@ -1312,6 +1697,8 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
       const rightDir = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
       rightDir.y = 0;
       rightDir.normalize();
+
+      let hasMovementInput = false;
 
       const moveForce = new THREE.Vector3(0, 0, 0);
       if (keysPressedRef.current['w']) moveForce.add(forwardDir);
@@ -1324,9 +1711,10 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
         const activeSpeed = 7.5; // Player running speed
         player.velocity.x += moveForce.x * activeSpeed * dt * 10;
         player.velocity.z += moveForce.z * activeSpeed * dt * 10;
+        hasMovementInput = true;
       }
 
-      // 3b. VR CONTROLLER LOCOMOTION (Thumbstick inputs)
+      // 6b. VR CONTROLLER LOCOMOTION (Thumbstick inputs)
       if (renderer.xr.isPresenting) {
         const session = renderer.xr.getSession();
         if (session) {
@@ -1352,16 +1740,7 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
                   const activeSpeed = 7.5;
                   player.velocity.x += vrMoveForce.x * activeSpeed * dt * 10;
                   player.velocity.z += vrMoveForce.z * activeSpeed * dt * 10;
-                }
-              }
-              // Right hand thumbstick can be used for smooth/snap turning!
-              else if (source.handedness === 'right' && axes.length >= 4) {
-                const stickX = axes[2];
-                if (Math.abs(stickX) > 0.15) {
-                  // Rotate player's camera/dolly smoothly around world Y-axis
-                  if (dollyRef.current) {
-                    dollyRef.current.rotateOnWorldAxis(new THREE.Vector3(0, 1, 0), -stickX * dt * 2.0);
-                  }
+                  hasMovementInput = true;
                 }
               }
             }
@@ -1369,7 +1748,16 @@ export const VRGameCanvas: React.FC<VRGameCanvasProps> = ({
         }
       }
 
-      // 4. RUN PHYSICS SIMULATION FOR PLAYER
+      // Apply fast deceleration if no active movement input to stop the "ice skating" effect
+      if (!hasMovementInput) {
+        // Decelerate extremely fast and smooth
+        player.velocity.x *= Math.pow(0.001, dt * 10);
+        player.velocity.z *= Math.pow(0.001, dt * 10);
+        if (Math.abs(player.velocity.x) < 0.05) player.velocity.x = 0;
+        if (Math.abs(player.velocity.z) < 0.05) player.velocity.z = 0;
+      }
+
+      // 7. RUN PHYSICS SIMULATION FOR PLAYER
       const currentConfig = TOWER_FLOORS.find((f) => f.floorNumber === player.floor);
       const towerRadius = currentConfig ? currentConfig.radius : 15.0;
 

@@ -45,7 +45,6 @@ export default function App() {
       
       {/* 1. CORE VR THREE.JS CANVAS */}
       <VRGameCanvas 
-        key={gameState === 'menu' ? 'menu-reset' : 'game-active'}
         activeGameState={gameState}
         onScoreChange={setScore}
         onKillsChange={setKills}
